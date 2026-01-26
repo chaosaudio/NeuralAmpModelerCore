@@ -24,7 +24,8 @@ else()
 	message(FATAL_ERROR "Unrecognized Platform!")
 endif()
 
-set(NAM_DEPS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/Dependencies")
+# STRATUS: Eigen is located at shared/eigen (sibling to NeuralAmpModelerCore)
+set(NAM_DEPS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/..")
 include_directories(SYSTEM "${NAM_DEPS_PATH}/eigen")
 
 # Build the specialized A2 fast-path WaveNet (A2 standard + A2 nano). When ON,
