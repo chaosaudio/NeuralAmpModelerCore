@@ -37,7 +37,9 @@ if(NAM_ENABLE_A2_FAST)
 	add_compile_definitions(NAM_ENABLE_A2_FAST)
 endif()
 
-add_subdirectory(tools)
+# STRATUS: Disable building NAM's internal tools and tests
+# They conflict with NAM_SAMPLE_FLOAT and we have our own benchmarking system
+# add_subdirectory(tools)
 
 #file(MAKE_DIRECTORY build/tools)
 
