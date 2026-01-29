@@ -37,6 +37,40 @@ if(NAM_ENABLE_A2_FAST)
 	add_compile_definitions(NAM_ENABLE_A2_FAST)
 endif()
 
+# ============================================================
+# STRATUS: Build NAM as static library
+# ============================================================
+# NAM's original CMakeLists only builds executables in tools/ subdirectory.
+# We need the library for firmware integration, so we build it explicitly.
+
+file(GLOB_RECURSE NAM_SOURCES NAM/*.cpp NAM/*.c)
+file(GLOB_RECURSE NAM_HEADERS NAM/*.h)
+
+add_library(NeuralAmpModelerCore STATIC ${NAM_SOURCES} ${NAM_HEADERS})
+
+target_include_directories(NeuralAmpModelerCore PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/NAM
+    ${NAM_DEPS_PATH}/eigen
+)
+
+target_compile_features(NeuralAmpModelerCore PUBLIC cxx_std_17)
+
+# Match optimization flags from Stratus firmware
+if (NOT MSVC)
+    target_compile_options(NeuralAmpModelerCore PRIVATE
+        -O3 -fPIC -ftree-vectorize -ffast-math
+        -Wall -Wextra
+    )
+endif()
+
+# Embedded/single-core optimizations
+target_compile_definitions(NeuralAmpModelerCore PRIVATE
+    EIGEN_DONT_PARALLELIZE  # Disable Eigen threading (Stratus is single-core audio)
+    NDEBUG                  # Disable assertions in release builds
+    NAM_USE_INLINE_GEMM     # Hand-optimized GEMM kernels (~3x faster than Eigen on ARM)
+)
+
 # STRATUS: Disable building NAM's internal tools and tests
 # They conflict with NAM_SAMPLE_FLOAT and we have our own benchmarking system
 # add_subdirectory(tools)
