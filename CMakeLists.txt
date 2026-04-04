@@ -59,7 +59,7 @@ target_compile_features(NeuralAmpModelerCore PUBLIC cxx_std_17)
 # Match optimization flags from Stratus firmware
 if (NOT MSVC)
     target_compile_options(NeuralAmpModelerCore PRIVATE
-        -O3 -fPIC -ftree-vectorize -ffast-math
+        -O3 -fPIC -ftree-vectorize -ffast-math -funroll-loops
         -Wall -Wextra
     )
 endif()

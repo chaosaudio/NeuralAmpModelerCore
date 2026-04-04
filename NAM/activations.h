@@ -11,6 +11,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 #include <Eigen/Dense>
 
 #include "json.hpp"
@@ -96,6 +100,54 @@ inline float fast_tanh(const float x)
   return (x * (2.45550750702956f + 2.45550750702956f * ax + (0.893229853513558f + 0.821226666969744f * ax) * x2)
           / (2.44506634652299f + (2.44506634652299f + x2) * fabsf(x + 0.814642734961073f * x * ax)));
 }
+
+#ifdef __ARM_NEON
+// NEON-vectorized fast_tanh: processes 4 floats at a time
+// Same polynomial approximation as the scalar version above
+inline void fast_tanh_neon(float* data, long size)
+{
+  const float32x4_t c1 = vdupq_n_f32(2.45550750702956f);
+  const float32x4_t c2 = vdupq_n_f32(0.893229853513558f);
+  const float32x4_t c3 = vdupq_n_f32(0.821226666969744f);
+  const float32x4_t c4 = vdupq_n_f32(2.44506634652299f);
+  const float32x4_t c5 = vdupq_n_f32(0.814642734961073f);
+
+  long pos = 0;
+  for (; pos + 3 < size; pos += 4)
+  {
+    float32x4_t x = vld1q_f32(data + pos);
+    float32x4_t ax = vabsq_f32(x);
+    float32x4_t x2 = vmulq_f32(x, x);
+
+    // Numerator: x * (c1 + c1*ax + (c2 + c3*ax) * x2)
+    float32x4_t inner = vmlaq_f32(c2, c3, ax);        // c2 + c3*ax
+    inner = vmulq_f32(inner, x2);                       // (c2 + c3*ax) * x2
+    float32x4_t num = vmlaq_f32(c1, c1, ax);           // c1 + c1*ax
+    num = vaddq_f32(num, inner);                         // c1 + c1*ax + (c2 + c3*ax)*x2
+    num = vmulq_f32(x, num);                             // x * (...)
+
+    // Denominator: c4 + (c4 + x2) * |x + c5 * x * ax|
+    float32x4_t x_ax = vmulq_f32(x, ax);                // x * ax
+    float32x4_t denom_inner = vmlaq_f32(x, c5, x_ax);  // x + c5 * x * ax
+    denom_inner = vabsq_f32(denom_inner);                // |x + c5 * x * ax|
+    float32x4_t denom = vaddq_f32(c4, x2);              // c4 + x2
+    denom = vmlaq_f32(c4, denom, denom_inner);           // c4 + (c4 + x2) * |...|
+
+    // Result: num / denom
+    // NEON reciprocal estimate + Newton-Raphson refinement (faster than division)
+    float32x4_t inv = vrecpeq_f32(denom);
+    inv = vmulq_f32(inv, vrecpsq_f32(denom, inv));       // One Newton-Raphson step
+    inv = vmulq_f32(inv, vrecpsq_f32(denom, inv));       // Second step for full float precision
+
+    vst1q_f32(data + pos, vmulq_f32(num, inv));
+  }
+  // Scalar tail
+  for (; pos < size; pos++)
+  {
+    data[pos] = fast_tanh(data[pos]);
+  }
+}
+#endif
 
 inline float fast_sigmoid(const float x)
 {
@@ -196,10 +248,25 @@ class ActivationHardTanh : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef __ARM_NEON
+    const float32x4_t neg_one = vdupq_n_f32(-1.0f);
+    const float32x4_t pos_one = vdupq_n_f32(1.0f);
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      float32x4_t x = vld1q_f32(data + pos);
+      x = vmaxq_f32(x, neg_one);
+      x = vminq_f32(x, pos_one);
+      vst1q_f32(data + pos, x);
+    }
+    for (; pos < size; pos++)
+      data[pos] = hard_tanh(data[pos]);
+#else
     for (long pos = 0; pos < size; pos++)
     {
       data[pos] = hard_tanh(data[pos]);
     }
+#endif
   }
 };
 
@@ -234,10 +301,14 @@ class ActivationFastTanh : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef __ARM_NEON
+    fast_tanh_neon(data, size);
+#else
     for (long pos = 0; pos < size; pos++)
     {
       data[pos] = fast_tanh(data[pos]);
     }
+#endif
   }
 };
 
@@ -246,8 +317,20 @@ class ActivationReLU : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef __ARM_NEON
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      float32x4_t x = vld1q_f32(data + pos);
+      vst1q_f32(data + pos, vmaxq_f32(x, zero));
+    }
+    for (; pos < size; pos++)
+      data[pos] = relu(data[pos]);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = relu(data[pos]);
+#endif
   }
 };
 
@@ -356,8 +439,26 @@ class ActivationHardSwish : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef __ARM_NEON
+    const float32x4_t three = vdupq_n_f32(3.0f);
+    const float32x4_t six = vdupq_n_f32(6.0f);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const float32x4_t inv6 = vdupq_n_f32(1.0f / 6.0f);
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      float32x4_t x = vld1q_f32(data + pos);
+      float32x4_t t = vaddq_f32(x, three);
+      t = vmaxq_f32(t, zero);
+      t = vminq_f32(t, six);
+      vst1q_f32(data + pos, vmulq_f32(vmulq_f32(x, t), inv6));
+    }
+    for (; pos < size; pos++)
+      data[pos] = hardswish(data[pos]);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = hardswish(data[pos]);
+#endif
   }
 };
 
@@ -366,8 +467,24 @@ class ActivationSoftsign : public Activation
 public:
   void apply(float* data, long size) override
   {
+#ifdef __ARM_NEON
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    long pos = 0;
+    for (; pos + 3 < size; pos += 4)
+    {
+      float32x4_t x = vld1q_f32(data + pos);
+      float32x4_t denom = vaddq_f32(one, vabsq_f32(x));
+      float32x4_t inv = vrecpeq_f32(denom);
+      inv = vmulq_f32(inv, vrecpsq_f32(denom, inv));
+      inv = vmulq_f32(inv, vrecpsq_f32(denom, inv));
+      vst1q_f32(data + pos, vmulq_f32(x, inv));
+    }
+    for (; pos < size; pos++)
+      data[pos] = softsign(data[pos]);
+#else
     for (long pos = 0; pos < size; pos++)
       data[pos] = softsign(data[pos]);
+#endif
   }
 };
 
