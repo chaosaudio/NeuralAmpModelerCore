@@ -1220,11 +1220,23 @@ bool config_is_slimmable_wavenet(const nlohmann::json& config)
 std::unique_ptr<nam::ModelConfig> nam::wavenet::create_config(const nlohmann::json& config, double sampleRate)
 {
   if (config_is_slimmable_wavenet(config))
+  {
+    std::cerr << "[NAM] WaveNet create_config: routing to SlimmableWavenet" << std::endl;
     return nam::slimmable_wavenet::create_config(config, sampleRate);
+  }
 
 #if defined(NAM_ENABLE_A2_FAST)
   if (int a2_channels = 0; nam::wavenet::a2_fast::is_a2_shape(config, &a2_channels))
+  {
+    std::cerr << "[NAM] WaveNet create_config: A2 shape matched (ch=" << a2_channels << "), routing to A2 fast-path" << std::endl;
     return nam::wavenet::a2_fast::create_a2_fast_config(config, sampleRate);
+  }
+  else
+  {
+    std::cerr << "[NAM] WaveNet create_config: A2 shape NOT matched, using generic WaveNet" << std::endl;
+  }
+#else
+  std::cerr << "[NAM] WaveNet create_config: NAM_ENABLE_A2_FAST not defined!" << std::endl;
 #endif
 
   auto wc = std::make_unique<WaveNetConfig>();

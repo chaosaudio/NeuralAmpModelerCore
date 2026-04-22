@@ -904,6 +904,7 @@ std::unique_ptr<ModelConfig> create_a2_fast_config(const nlohmann::json& config,
   int ch = 0;
   if (!is_a2_shape(config, &ch))
     throw std::runtime_error("create_a2_fast_config: config does not match A2 shape");
+  std::cerr << "[NAM] A2 fast-path: creating A2FastModel with channels=" << ch << std::endl;
   auto out = std::make_unique<A2FastConfig>();
   out->channels = ch;
   return out;
