@@ -909,6 +909,15 @@ std::unique_ptr<ModelConfig> create_a2_fast_config(const nlohmann::json& config,
   return out;
 }
 
+std::unique_ptr<DSP> create_a2_fast(int channels, std::vector<float> weights, double sampleRate)
+{
+  if (channels == 3)
+    return std::make_unique<A2FastModel<3>>(std::move(weights), sampleRate);
+  if (channels == 8)
+    return std::make_unique<A2FastModel<8>>(std::move(weights), sampleRate);
+  return nullptr;
+}
+
 } // namespace a2_fast
 } // namespace wavenet
 } // namespace nam

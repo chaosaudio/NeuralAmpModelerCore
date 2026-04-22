@@ -54,6 +54,13 @@ bool is_a2_shape(const nlohmann::json& config, int* channels);
 /// \pre is_a2_shape(config, ...) returned true.
 std::unique_ptr<ModelConfig> create_a2_fast_config(const nlohmann::json& config, double sampleRate);
 
+/// \brief Create an A2 fast-path DSP directly from weights.
+/// \param channels Must be 3 (nano) or 8 (standard).
+/// \param weights Model weights vector.
+/// \param sampleRate Expected sample rate.
+/// \return Unique pointer to DSP, or nullptr if channels is unsupported.
+std::unique_ptr<DSP> create_a2_fast(int channels, std::vector<float> weights, double sampleRate);
+
 } // namespace a2_fast
 } // namespace wavenet
 } // namespace nam

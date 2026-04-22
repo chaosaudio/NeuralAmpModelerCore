@@ -1,5 +1,8 @@
 #include "slimmable.h"
 #include "../get_dsp.h"
+#if defined(NAM_ENABLE_A2_FAST)
+#include "a2_fast.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -371,6 +374,31 @@ void SlimmableWavenet::_rebuild_model(const std::vector<int>& target_channels)
     condition_dsp = get_dsp(_condition_dsp_json);
 
   double sampleRate = _current_sample_rate > 0 ? _current_sample_rate : GetExpectedSampleRate();
+
+#if defined(NAM_ENABLE_A2_FAST)
+  // Try A2 fast-path: single layer array, channels 3 or 8, matching A2 shape
+  if (params_ptr->size() == 1 && !_with_head && !condition_dsp)
+  {
+    const auto& p = (*params_ptr)[0];
+    const int ch = p.channels;
+    const int nLayers = (int)p.dilations.size();
+    if ((ch == 3 || ch == 8) && nLayers == wavenet::a2_fast::kNumLayers
+        && std::equal(p.kernel_sizes.begin(), p.kernel_sizes.end(), wavenet::a2_fast::kKernelSizes.begin())
+        && std::equal(p.dilations.begin(), p.dilations.end(), wavenet::a2_fast::kDilations.begin()))
+    {
+      auto fast = wavenet::a2_fast::create_a2_fast(ch, std::move(weights), sampleRate);
+      if (fast)
+      {
+        _active_model = std::move(fast);
+        _current_channels = target_channels;
+        if (_current_buffer_size > 0)
+          _active_model->Reset(_current_sample_rate, _current_buffer_size);
+        return;
+      }
+    }
+  }
+#endif
+
   _active_model = std::make_unique<wavenet::WaveNet>(_in_channels, *params_ptr, _head_scale, _with_head, std::nullopt,
                                                      std::move(weights), std::move(condition_dsp), sampleRate);
   _current_channels = target_channels;
