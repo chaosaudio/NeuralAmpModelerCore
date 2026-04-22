@@ -32,11 +32,6 @@ include_directories(SYSTEM "${NAM_DEPS_PATH}/eigen")
 # models whose config matches the A2 shape signature are routed to a hand-optimized
 # WaveNet implementation instead of the generic one. When OFF, all models go
 # through the generic path.
-option(NAM_ENABLE_A2_FAST "Build the A2 fast-path WaveNet" ON)
-if(NAM_ENABLE_A2_FAST)
-	add_compile_definitions(NAM_ENABLE_A2_FAST)
-endif()
-
 # ============================================================
 # STRATUS: Build NAM as static library
 # ============================================================
@@ -69,6 +64,7 @@ target_compile_definitions(NeuralAmpModelerCore PRIVATE
     EIGEN_DONT_PARALLELIZE  # Disable Eigen threading (Stratus is single-core audio)
     NDEBUG                  # Disable assertions in release builds
     NAM_USE_INLINE_GEMM     # Hand-optimized GEMM kernels (~3x faster than Eigen on ARM)
+    NAM_ENABLE_A2_FAST      # A2 fast-path WaveNet for nano (ch=3) and standard (ch=8) models
 )
 
 # STRATUS: Disable building NAM's internal tools and tests
