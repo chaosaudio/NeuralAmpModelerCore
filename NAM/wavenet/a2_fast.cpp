@@ -25,6 +25,10 @@
 
 #include <Eigen/Dense>
 
+#ifdef __ARM_NEON__
+#include <arm_neon.h>
+#endif
+
 #include "../dsp.h"
 
 namespace nam
@@ -327,8 +331,13 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 
 // -----------------------------------------------------------------------------
 // Ring-write helpers.
-//   Mode 1: pow2 + tail mirror. Constant-time per block (one short memcpy
-//   into the ring, one mirror refresh).
+//   Mode 1: pow2 + tail mirror, mirror-on-demand. The conv loop reads
+//   `tap_base + f` unmasked, so the mirror at [pow2_size, pow2_size + N)
+//   covers reads that overflow past pow2_size. Predict next-call read
+//   ranges per tap from new_wp + dilation; mirror only the bytes actually
+//   needed (frequently zero — only the layers + write positions where a
+//   tap's read range straddles the wrap). Saves the full mbs * Channels *
+//   sizeof(float) memcpy per layer per block when no tap will wrap.
 //   Mode 0: linear with periodic memmove rewind. When write_pos nears the
 //   end of history, memmove the trailing max_lookback cols back to offset 0
 //   and reset write_pos. That memmove is the jitter spike we're measuring.
@@ -337,7 +346,6 @@ template <int Channels>
 void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
 {
 #if NAM_A2_RING_MODE == 1
-  const int mbs = GetMaxBufferSize();
   float* const hist = L.history.data();
   const float* const src = _layer_in.data();
   const int wp = L.write_pos;
@@ -349,9 +357,35 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
     std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
                 static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
   }
-  std::memcpy(hist + static_cast<size_t>(L.pow2_size) * Channels, hist,
-              static_cast<size_t>(mbs) * Channels * sizeof(float));
-  L.write_pos = (wp + num_frames) & L.pow2_mask;
+
+  const int new_wp = (wp + num_frames) & L.pow2_mask;
+
+  // Mirror-on-demand: predict the next call's read addresses for each tap
+  // and find the max overflow past pow2_size. Mirror only that many entries.
+  // (Assumes num_frames is stable across calls, which it is on Stratus —
+  //  the audio buffer size is fixed at runtime.)
+  int mirror_needed = 0;
+  const int K = L.kernel_size;
+  const int D = L.dilation;
+  for (int k = 0; k < K; k++)
+  {
+    const int taps_back = K - 1 - k;
+    const int tap_base = (new_wp - num_frames - taps_back * D) & L.pow2_mask;
+    const int read_end = tap_base + num_frames - 1;
+    if (read_end >= L.pow2_size)
+    {
+      const int overflow = read_end - L.pow2_size + 1;
+      if (overflow > mirror_needed)
+        mirror_needed = overflow;
+    }
+  }
+  if (mirror_needed > 0)
+  {
+    std::memcpy(hist + static_cast<size_t>(L.pow2_size) * Channels, hist,
+                static_cast<size_t>(mirror_needed) * Channels * sizeof(float));
+  }
+
+  L.write_pos = new_wp;
 #else
   if (L.write_pos + num_frames > L.history_cols)
   {
@@ -370,7 +404,10 @@ template <int Channels>
 void A2FastModel<Channels>::_head_ring_write(int num_frames)
 {
 #if NAM_A2_RING_MODE == 1
-  const int mbs = GetMaxBufferSize();
+  // Note: head_forward's col_of() lambda masks every access (`& mask`), so
+  // accesses are always in [0, pow2_size) and the tail mirror is never read.
+  // Skipping the mirror copy entirely saves mbs * Channels * sizeof(float)
+  // bytes of memcpy per block.
   float* const hist = _head_history.data();
   const float* const src = _head_sum.data();
   const int wp = _head_write_pos;
@@ -382,8 +419,6 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
     std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
                 static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
   }
-  std::memcpy(hist + static_cast<size_t>(_head_pow2_size) * Channels, hist,
-              static_cast<size_t>(mbs) * Channels * sizeof(float));
   _head_write_pos = (wp + num_frames) & _head_pow2_mask;
 #else
   const int keep = kHeadKernelSize - 1;
@@ -450,6 +485,25 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     // before the frame loop, the c-reduction kept in scalar temps a0/a1/a2 so
     // the compiler keeps them in FP registers across the frame loop. Mirrors
     // the nam2c --fused structure.
+    //
+    // NOTE: An NEON 4-frame-tiled kernel was tried and measured ~32% SLOWER
+    // on Cortex-A8 than this scalar code. Two reasons:
+    //   1. vld3q_f32 / vst3q_f32 on A8 take ~10 cycles each (deinterleaved
+    //      load/store is not free). At 3 channels they're issued on every
+    //      tile, every tap.
+    //   2. NEON Q-form VMLA.F32 has the same 9-cycle latency and 1/cycle
+    //      throughput as VFP scalar VFMA. Wider parallelism only wins when
+    //      you can pack independent FMAs — the 3x3 GEMV has only 3 parallel
+    //      chains of length 3, so NEON doesn't expose more parallelism than
+    //      the compiler's auto-unrolled scalar code already exploits.
+    // For 8 channels the tradeoff flips (vld1q is cheap, more parallel
+    // chains, deeper chains) and the hand-rolled NEON kernel wins.
+    //
+    // CLEAN PLD DIAGNOSTIC: one __builtin_prefetch per tap entry, placed
+    // before the inner frame loop. No in-loop branching, no "next tap"
+    // speculation, no multi-line prefetch. If even this minimal pattern
+    // doesn't deliver savings, the path is definitively compute-bound and
+    // W16A16 quantization (a memory-bandwidth play) won't help either.
     float* z = _z.data();
 
     // Tap 0: seed z with conv_b (saves the memset-to-zero pass) and fold in
@@ -457,6 +511,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     {
       const float* wk = &L.conv_w[0];
       const int tap_base = tap_base_phys(K - 1);
+      __builtin_prefetch(&L.history[static_cast<size_t>(tap_base) * 3], 0, 3);
       const float w0 = wk[0], w1 = wk[1], w2 = wk[2];
       const float w3 = wk[3], w4 = wk[4], w5 = wk[5];
       const float w6 = wk[6], w7 = wk[7], w8 = wk[8];
@@ -485,6 +540,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     {
       const float* wk = &L.conv_w[static_cast<size_t>(k) * 9];
       const int tap_base = tap_base_phys(K - 1 - k);
+      __builtin_prefetch(&L.history[static_cast<size_t>(tap_base) * 3], 0, 3);
       const float w0 = wk[0], w1 = wk[1], w2 = wk[2];
       const float w3 = wk[3], w4 = wk[4], w5 = wk[5];
       const float w6 = wk[6], w7 = wk[7], w8 = wk[8];
@@ -512,6 +568,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     //   conv tap K-1 -> mixin -> LeakyReLU -> head_sum += -> layer1x1 residual.
     const float* wk_last = &L.conv_w[static_cast<size_t>(K - 1) * 9];
     const int tap_base_last = tap_base_phys(0);
+    __builtin_prefetch(&L.history[static_cast<size_t>(tap_base_last) * 3], 0, 3);
     const float cw0 = wk_last[0], cw1 = wk_last[1], cw2 = wk_last[2];
     const float cw3 = wk_last[3], cw4 = wk_last[4], cw5 = wk_last[5];
     const float cw6 = wk_last[6], cw7 = wk_last[7], cw8 = wk_last[8];
@@ -587,7 +644,99 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
 
     ztile.setZero();
 
-    // Conv: one 8x8 × 8xN GEMM per tap.
+#if defined(__ARM_NEON__)
+    // -----------------------------------------------------------------------
+    // Conv: hand-rolled NEON 8x4 microkernel.
+    //
+    // For each of K taps, accumulate ztile[c, f] += W[c, c'] * H[c', f]
+    // (column-major, c' = input channel, c = output channel). Tile by T=4
+    // frames so 8 output channels × 4 frames live in 8 NEON Q-registers
+    // across the c' inner loop. For each c' in [0,8): load W[:,c'] once
+    // (2 Q-regs reused across all 4 frames), then 4× vmlaq_n_f32 broadcasts
+    // of H[c', f]. Inner loop has no register-level dependency between the
+    // 8 accumulators, so the in-order Cortex-A8 NEON pipeline can issue an
+    // FMA every cycle.
+    //
+    // 64 fp32 FMAs per tile × num_frames/4 tiles per tap × K taps per layer.
+    // Replaces Eigen's 8x8 × 8xN GEMM, which dispatches to a small-matrix
+    // path that hadn't kept its accumulators register-resident across taps.
+    // -----------------------------------------------------------------------
+    {
+      float* z = _z.data();
+      const float* hist_base = L.history.data();
+      const float* W_all = L.conv_w.data();
+
+      for (int k = 0; k < K; k++)
+      {
+        const int tap_base = tap_base_phys(K - 1 - k);
+        const float* W = W_all + static_cast<size_t>(k) * Channels * Channels;
+        const float* hist = hist_base + static_cast<size_t>(tap_base) * Channels;
+
+        const int neonF = (num_frames / 4) * 4;
+        int f = 0;
+        for (; f < neonF; f += 4)
+        {
+          float* z_base = z + static_cast<size_t>(f) * Channels;
+          const float* h_base = hist + static_cast<size_t>(f) * Channels;
+
+          // Load running sum for 4 frames × 8 channels.
+          float32x4_t a0_lo = vld1q_f32(z_base + 0 * Channels + 0);
+          float32x4_t a0_hi = vld1q_f32(z_base + 0 * Channels + 4);
+          float32x4_t a1_lo = vld1q_f32(z_base + 1 * Channels + 0);
+          float32x4_t a1_hi = vld1q_f32(z_base + 1 * Channels + 4);
+          float32x4_t a2_lo = vld1q_f32(z_base + 2 * Channels + 0);
+          float32x4_t a2_hi = vld1q_f32(z_base + 2 * Channels + 4);
+          float32x4_t a3_lo = vld1q_f32(z_base + 3 * Channels + 0);
+          float32x4_t a3_hi = vld1q_f32(z_base + 3 * Channels + 4);
+
+          // Accumulate W[:,c'] * h[c',f] for each input channel c'.
+          for (int cp = 0; cp < Channels; cp++)
+          {
+            float32x4_t w_lo = vld1q_f32(W + cp * Channels + 0);
+            float32x4_t w_hi = vld1q_f32(W + cp * Channels + 4);
+
+            const float i0 = h_base[0 * Channels + cp];
+            const float i1 = h_base[1 * Channels + cp];
+            const float i2 = h_base[2 * Channels + cp];
+            const float i3 = h_base[3 * Channels + cp];
+
+            a0_lo = vmlaq_n_f32(a0_lo, w_lo, i0);
+            a0_hi = vmlaq_n_f32(a0_hi, w_hi, i0);
+            a1_lo = vmlaq_n_f32(a1_lo, w_lo, i1);
+            a1_hi = vmlaq_n_f32(a1_hi, w_hi, i1);
+            a2_lo = vmlaq_n_f32(a2_lo, w_lo, i2);
+            a2_hi = vmlaq_n_f32(a2_hi, w_hi, i2);
+            a3_lo = vmlaq_n_f32(a3_lo, w_lo, i3);
+            a3_hi = vmlaq_n_f32(a3_hi, w_hi, i3);
+          }
+
+          vst1q_f32(z_base + 0 * Channels + 0, a0_lo);
+          vst1q_f32(z_base + 0 * Channels + 4, a0_hi);
+          vst1q_f32(z_base + 1 * Channels + 0, a1_lo);
+          vst1q_f32(z_base + 1 * Channels + 4, a1_hi);
+          vst1q_f32(z_base + 2 * Channels + 0, a2_lo);
+          vst1q_f32(z_base + 2 * Channels + 4, a2_hi);
+          vst1q_f32(z_base + 3 * Channels + 0, a3_lo);
+          vst1q_f32(z_base + 3 * Channels + 4, a3_hi);
+        }
+
+        // Scalar tail for any frames past the multiple-of-4 boundary.
+        for (; f < num_frames; f++)
+        {
+          float* z_col = z + static_cast<size_t>(f) * Channels;
+          const float* h_col = hist + static_cast<size_t>(f) * Channels;
+          for (int o = 0; o < Channels; o++)
+          {
+            float sum = z_col[o];
+            for (int cp = 0; cp < Channels; cp++)
+              sum += W[cp * Channels + o] * h_col[cp];
+            z_col[o] = sum;
+          }
+        }
+      }
+    }
+#else
+    // Eigen fallback for non-ARM builds (host-side dev / tests).
     for (int k = 0; k < K; k++)
     {
       const int tap_base = tap_base_phys(K - 1 - k);
@@ -595,6 +744,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
       ztile.noalias() += W * input_block;
     }
+#endif
 
     // Post-conv: bias, mixin, LeakyReLU, head_sum, 1x1 residual — all block ops.
     ztile.colwise() += conv_b_vec;
