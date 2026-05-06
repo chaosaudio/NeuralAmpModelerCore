@@ -149,13 +149,19 @@ private:
   void _load_weights(std::vector<float>& weights);
   void _ring_write(Layer& L, int num_frames);
   void _head_ring_write(int num_frames);
-  void _layer_forward(int layer_idx, const float* cond, int num_frames);
+  void _layer_forward(int layer_idx, const float* cond, int num_frames, bool is_first);
   void _head_forward(float* output, int num_frames);
 
   // Compile-time-specialized per-layer kernel. KernelSize is lifted to a
   // template parameter so clang can fully unroll the tap loop and schedule
   // FMAs across taps. For the A2 shape we only need K=6 and K=15.
-  template <int KernelSize>
+  //
+  // IsFirst selects whether the head-sum write uses `=` (first layer,
+  // initializing _head_sum) or `+=` (subsequent layers, accumulating).
+  // This lets us drop the explicit memset of _head_sum at process() entry
+  // — saves Channels * num_frames * 4 bytes of writes per buffer that
+  // would otherwise pollute L1 cache lines.
+  template <int KernelSize, bool IsFirst>
   void _layer_forward_k(Layer& L, const float* cond, int num_frames);
 };
 
@@ -444,7 +450,7 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
 // clang fully unrolls and can schedule FMAs across taps. Called from the
 // runtime dispatcher below for each A2 kernel size (6 and 15).
 template <int Channels>
-template <int KernelSize>
+template <int KernelSize, bool IsFirst>
 void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int num_frames)
 {
   constexpr int K = KernelSize;
@@ -600,11 +606,19 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       a0 = (a0 >= 0.0f) ? a0 : a0 * kLeakySlope;
       a1 = (a1 >= 0.0f) ? a1 : a1 * kLeakySlope;
       a2 = (a2 >= 0.0f) ? a2 : a2 * kLeakySlope;
-      // Head sum accumulate.
+      // Head sum: assign on the first layer (initializes _head_sum,
+      // replacing the would-be memset), accumulate on subsequent layers.
+      // if constexpr resolves at compile time — no runtime branch.
       float* hsum = &_head_sum[static_cast<size_t>(f) * 3];
-      hsum[0] += a0;
-      hsum[1] += a1;
-      hsum[2] += a2;
+      if constexpr (IsFirst) {
+        hsum[0] = a0;
+        hsum[1] = a1;
+        hsum[2] = a2;
+      } else {
+        hsum[0] += a0;
+        hsum[1] += a1;
+        hsum[2] += a2;
+      }
       // layer1x1 residual.
       float* lin = &_layer_in[static_cast<size_t>(f) * 3];
       lin[0] += lb0 + lw00 * a0 + lw10 * a1 + lw20 * a2;
@@ -750,7 +764,12 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     ztile.colwise() += conv_b_vec;
     ztile.noalias() += mixin_vec * cond_row;                               // rank-1 outer product
     ztile = (ztile.array() < 0.0f).select(ztile.array() * kLeakySlope, ztile.array());
-    hsum_block += ztile;
+    // First-layer assigns into _head_sum (replaces the memset);
+    // subsequent layers accumulate. Compile-time branch.
+    if constexpr (IsFirst)
+      hsum_block = ztile;
+    else
+      hsum_block += ztile;
     lin_block.noalias() += l1x1_mat * ztile;                               // 8x8 × 8xN GEMM
     lin_block.colwise() += l1x1_b_vec;
   }
@@ -759,18 +778,24 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
 // Runtime dispatcher: selects the K-specialized kernel for this layer.
 // For the A2 shape the detector only admits K in {6, 15}; any other value
 // here means something passed the detector that shouldn't have.
+//
+// is_first selects the layer-0-only code path that initializes _head_sum
+// via assignment (rather than accumulating into it). Branched at runtime
+// here, but inside the kernel the choice is a compile-time constant.
 template <int Channels>
-void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int num_frames)
+void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int num_frames, bool is_first)
 {
   Layer& L = _layers[layer_idx];
   _ring_write(L, num_frames);
   switch (L.kernel_size)
   {
     case 6:
-      _layer_forward_k<6>(L, cond, num_frames);
+      if (is_first) _layer_forward_k<6, true>(L, cond, num_frames);
+      else          _layer_forward_k<6, false>(L, cond, num_frames);
       break;
     case 15:
-      _layer_forward_k<15>(L, cond, num_frames);
+      if (is_first) _layer_forward_k<15, true>(L, cond, num_frames);
+      else          _layer_forward_k<15, false>(L, cond, num_frames);
       break;
     default:
       throw std::runtime_error("A2FastModel: unexpected kernel_size "
@@ -834,11 +859,12 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
       lin[c] = _rechannel_w[c] * x;
   }
 
-  // Zero head accumulator.
-  std::memset(_head_sum.data(), 0, static_cast<size_t>(num_frames) * Channels * sizeof(float));
-
-  for (int li = 0; li < kNumLayers; li++)
-    _layer_forward(li, cond, num_frames);
+  // _head_sum is initialized by the first layer's IsFirst=true write
+  // (assignment, not accumulation) instead of an explicit memset here —
+  // skips Channels * num_frames * 4 bytes of zero-fill writes per buffer.
+  _layer_forward(0, cond, num_frames, /*is_first=*/true);
+  for (int li = 1; li < kNumLayers; li++)
+    _layer_forward(li, cond, num_frames, /*is_first=*/false);
 
   // Output.
   float* head_out = _head_out.data();
