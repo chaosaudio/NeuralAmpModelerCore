@@ -29,6 +29,14 @@
 #include <arm_neon.h>
 #endif
 
+#ifdef STRATUS_NAM_LAYER_PROFILING
+#include <cstdint>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#endif
+
 #include "../dsp.h"
 
 namespace nam
@@ -139,30 +147,56 @@ private:
 
   // Working buffers (all Channels rows, max_buffer_size cols, col-major).
   std::vector<float> _layer_in; // current layer input / next layer input (in-place residual)
-  std::vector<float> _head_sum; // accumulates activations across all layers
-  std::vector<float> _z;        // per-layer conv output accumulator (tap-major)
+  std::vector<float> _z;        // per-layer conv output accumulator (tap-major); used by Channels=8 path only
   std::vector<float> _cond;     // float32 copy of the double NAM_SAMPLE input, reused each block
   std::vector<float> _head_out; // float32 head output before writing to NAM_SAMPLE
 
   int _prewarm_samples = 0;
 
+#ifdef STRATUS_NAM_LAYER_PROFILING
+  // Per-layer wall-clock stats (CLOCK_MONOTONIC_RAW). Reset every dump.
+  // Per-call timer cost on Bela's Cortex-A8 measures ~1.3 µs (the kernel's
+  // clock_gettime is not VDSO-fast on this build), so 23 layers × 2 calls ≈
+  // 60 µs/buffer ≈ 5% CPU overhead at -p 128 / 44.1 kHz. Off in production
+  // by default; subtract ~5pt from the observed CPU% for a true reading.
+  struct LayerStats
+  {
+    double total_ns = 0.0;
+    double min_ns = std::numeric_limits<double>::max();
+    double max_ns = 0.0;
+    uint64_t calls = 0;
+  };
+  std::array<LayerStats, kNumLayers> _layer_stats{};
+  uint64_t _layer_stats_buffer_count = 0;
+  static constexpr uint64_t kLayerStatsDumpInterval = 3440;
+  bool _history_addrs_logged = false;
+
+  void _dump_layer_stats();
+  void _log_history_addresses();
+#endif
+
   void _load_weights(std::vector<float>& weights);
   void _ring_write(Layer& L, int num_frames);
-  void _head_ring_write(int num_frames);
-  void _layer_forward(int layer_idx, const float* cond, int num_frames, bool is_first);
+  void _layer_forward(int layer_idx, const float* cond, int num_frames, bool is_first, int head_wp);
   void _head_forward(float* output, int num_frames);
 
   // Compile-time-specialized per-layer kernel. KernelSize is lifted to a
-  // template parameter so clang can fully unroll the tap loop and schedule
-  // FMAs across taps. For the A2 shape we only need K=6 and K=15.
+  // template parameter so the K tap loop becomes a compile-time constant;
+  // the compiler can unroll and schedule FMAs across taps. For the A2 shape
+  // we only need K=6 and K=15.
   //
-  // IsFirst selects whether the head-sum write uses `=` (first layer,
-  // initializing _head_sum) or `+=` (subsequent layers, accumulating).
-  // This lets us drop the explicit memset of _head_sum at process() entry
-  // — saves Channels * num_frames * 4 bytes of writes per buffer that
-  // would otherwise pollute L1 cache lines.
+  // IsFirst selects whether the head accumulator write uses `=` (first layer,
+  // initializing the recent _head_history slots) or `+=` (subsequent layers).
+  // This lets us drop the explicit memset that a separate _head_sum buffer
+  // would otherwise need.
+  //
+  // head_wp is the snapshot of _head_write_pos at process() entry; layers
+  // write the head accumulator directly into _head_history[head_wp + f] (no
+  // intermediate _head_sum buffer). Caller (process()) ensures head_wp +
+  // num_frames does not overflow the writable contiguous range by rewinding
+  // when needed.
   template <int KernelSize, bool IsFirst>
-  void _layer_forward_k(Layer& L, const float* cond, int num_frames);
+  void _layer_forward_k(Layer& L, const float* cond, int num_frames, int head_wp);
 };
 
 // -----------------------------------------------------------------------------
@@ -303,7 +337,6 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
   DSP::SetMaxBufferSize(maxBufferSize);
 
   _layer_in.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
-  _head_sum.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
   _z.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
   _cond.assign(static_cast<size_t>(maxBufferSize), 0.0f);
   _head_out.assign(static_cast<size_t>(maxBufferSize), 0.0f);
@@ -406,40 +439,6 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
 #endif
 }
 
-template <int Channels>
-void A2FastModel<Channels>::_head_ring_write(int num_frames)
-{
-#if NAM_A2_RING_MODE == 1
-  // Note: head_forward's col_of() lambda masks every access (`& mask`), so
-  // accesses are always in [0, pow2_size) and the tail mirror is never read.
-  // Skipping the mirror copy entirely saves mbs * Channels * sizeof(float)
-  // bytes of memcpy per block.
-  float* const hist = _head_history.data();
-  const float* const src = _head_sum.data();
-  const int wp = _head_write_pos;
-  const int first = std::min(num_frames, _head_pow2_size - wp);
-  std::memcpy(hist + static_cast<size_t>(wp) * Channels, src,
-              static_cast<size_t>(first) * Channels * sizeof(float));
-  if (first < num_frames)
-  {
-    std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
-                static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
-  }
-  _head_write_pos = (wp + num_frames) & _head_pow2_mask;
-#else
-  const int keep = kHeadKernelSize - 1;
-  if (_head_write_pos + num_frames > _head_history_cols)
-  {
-    std::memmove(_head_history.data(), _head_history.data() + static_cast<size_t>(_head_write_pos - keep) * Channels,
-                 static_cast<size_t>(keep) * Channels * sizeof(float));
-    _head_write_pos = keep;
-  }
-  std::memcpy(_head_history.data() + static_cast<size_t>(_head_write_pos) * Channels, _head_sum.data(),
-              static_cast<size_t>(num_frames) * Channels * sizeof(float));
-  _head_write_pos += num_frames;
-#endif
-}
-
 // -----------------------------------------------------------------------------
 // Per-layer forward pass. Reads current _layer_in, writes back into _layer_in
 // after applying dilated conv + mixin + LeakyReLU + layer1x1 residual, and
@@ -451,7 +450,7 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
 // runtime dispatcher below for each A2 kernel size (6 and 15).
 template <int Channels>
 template <int KernelSize, bool IsFirst>
-void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int num_frames)
+void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int num_frames, int head_wp)
 {
   constexpr int K = KernelSize;
   const int D = L.dilation;
@@ -487,6 +486,36 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
 
   if constexpr (Channels == 3)
   {
+    // -------------------------------------------------------------------------
+    // CRITICAL: this kernel's loop nest (k outer, f inner over all num_frames)
+    // is what lets the compiler's loop vectorizer (LV) pack the inner f-loop
+    // into NEON Q-form FMAs. DO NOT switch to a frame-tile-outer / k-inner
+    // structure to "eliminate _z heap traffic". Two attempts have failed:
+    //
+    //   1. 2026-05: Fully-unrolled the T=4 tile into 12 named scalars (no
+    //      inner loop). Dropped clang/GCC from LV to SLP, which bailed to
+    //      VFP scalar code on the 3-channel stride-3 history loads. Cost
+    //      +94pt CPU (38% → 132%).
+    //   2. 2026-05 (later): kept the inner j-loop with `float a0[T]` arrays
+    //      and added `#pragma clang loop unroll(disable) vectorize(enable)`.
+    //      Host clang's LV did engage (verified via -Rpass=loop-vectorize
+    //      reports on Apple Silicon). But the FIRMWARE TOOLCHAIN IS GCC 10
+    //      (per Toolchain.cmake — arm-linux-gnueabihf-gcc-10), and clang
+    //      pragmas are silently ignored by GCC. Same +94pt regression as
+    //      attempt 1 on the Bela device. Lesson: clang pragmas don't
+    //      transfer to gcc; portable forcing requires `#pragma omp simd`
+    //      with `-fopenmp-simd`, or hand-NEON intrinsics with the unpadded
+    //      layout, or trusting GCC to engage LV on a sufficiently-large
+    //      tile (T=8 or larger).
+    //
+    // The cache-pollution concern around _z is real (per Bela layer-
+    // profiling 2026-05: _z mod-8K = 0x1740 overlaps dilation-239 layers'
+    // tap-4 reads at mod-8K ≈ 0x1688), but eliminating it via loop-nest
+    // swap is fragile across toolchains. If you need to attack _z again,
+    // the safest path is cache-coloring _z's allocation address — NOT
+    // restructuring the kernel.
+    // -------------------------------------------------------------------------
+    //
     // Inner 3x3 GEMV fully unrolled: all 9 weights lifted into named consts
     // before the frame loop, the c-reduction kept in scalar temps a0/a1/a2 so
     // the compiler keeps them in FP registers across the frame loop. Mirrors
@@ -606,10 +635,13 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       a0 = (a0 >= 0.0f) ? a0 : a0 * kLeakySlope;
       a1 = (a1 >= 0.0f) ? a1 : a1 * kLeakySlope;
       a2 = (a2 >= 0.0f) ? a2 : a2 * kLeakySlope;
-      // Head sum: assign on the first layer (initializes _head_sum,
-      // replacing the would-be memset), accumulate on subsequent layers.
-      // if constexpr resolves at compile time — no runtime branch.
-      float* hsum = &_head_sum[static_cast<size_t>(f) * 3];
+      // Head accumulator: write straight into _head_history at the current
+      // ring position (head_wp + f). Assign on the first layer (overwriting
+      // whatever stale data was at that slot), accumulate on subsequent
+      // layers. if constexpr resolves at compile time — no runtime branch.
+      // process() guarantees head_wp + num_frames stays within the writable
+      // contiguous range (rewinds when needed).
+      float* hsum = &_head_history[static_cast<size_t>(head_wp + f) * 3];
       if constexpr (IsFirst) {
         hsum[0] = a0;
         hsum[1] = a1;
@@ -628,6 +660,39 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   }
   else
   {
+    // =========================================================================
+    // !!! KNOWN REGRESSION — 8-CHANNEL PATH IS CURRENTLY SLOWER THAN ORIGINAL !!!
+    // =========================================================================
+    // Status (2026-05): Channels=8 measures ~517% CPU on Cortex-A8 1 GHz at
+    // -p 128. Before the hand-rolled NEON 8x4 microkernel was added below,
+    // this same path used Eigen's `ztile.noalias() = W * input_block` GEMM
+    // and ran at ~249% CPU.
+    //
+    // FIX PATH when 8-channel becomes load-bearing:
+    //   1. Delete the `#if defined(__ARM_NEON__) ... #else ... #endif` block
+    //      below. Keep ONLY the Eigen `for (int k = 0; k < K; k++) {...}`
+    //      loop currently in the #else branch — that's the original path.
+    //   2. Re-benchmark. Expect ~249% CPU (still not real-time on A8).
+    //   3. Real fix: smaller A2 Standard variant or faster silicon (A53 /
+    //      A55 / A72). 8ch on 1GHz A8 will never be real-time at -p 128.
+    //
+    // KEEP THESE — they help 8ch too:
+    //   - mirror-on-demand pow2 ring (_ring_write)
+    //   - ztile zero-fill drop (tap 0 seeds via vdupq_n_f32(0))
+    //   - _head_sum elimination (writes go straight to _head_history)
+    //
+    // DO NOT TRY:
+    //   - PLD/__builtin_prefetch attacks (cache-pollution-bound, made worse).
+    //   - NAM_CHUNK_SIZE < 128 (27% regression at 64).
+    //   - 4-channel-padded NEON refactor (+9pt on 3-channel; padding bloated
+    //     working set 33%).
+    //   - Loop-nest swap (k-outer/f-inner → f-tile-outer/k-inner) to drop _z.
+    //     Both fully-unrolled and pragma-driven attempts cost +94pt because
+    //     GCC silently ignored clang pragmas and SLP can't replace LV.
+    //
+    // See NAM_BENCHMARK.md "Known regression: 8-channel A2 Standard kernel".
+    // =========================================================================
+    //
     // Use Eigen's tuned 8x8 × 8xN GEMM for the whole block at once. Unlike a
     // small-tile version, this hits Eigen's actual GEMM kernel (tuned for
     // inner dimensions of ~64) rather than its tiny-matrix fallback path.
@@ -653,7 +718,10 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     Eigen::Map<const RowDyn> cond_row(cond, 1, num_frames);
 
     Eigen::Map<MatCDyn> ztile(_z.data(), Channels, num_frames);
-    Eigen::Map<MatCDyn> hsum_block(_head_sum.data(), Channels, num_frames);
+    // Map directly into _head_history at the current ring position. process()
+    // guarantees head_wp + num_frames stays within the writable contiguous
+    // range so this map cannot overflow.
+    Eigen::Map<MatCDyn> hsum_block(&_head_history[static_cast<size_t>(head_wp) * Channels], Channels, num_frames);
     Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, num_frames);
 
     // No ztile.setZero() — tap 0 below initializes ztile via vdupq_n_f32(0)
@@ -787,8 +855,8 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     ztile.colwise() += conv_b_vec;
     ztile.noalias() += mixin_vec * cond_row;                               // rank-1 outer product
     ztile = (ztile.array() < 0.0f).select(ztile.array() * kLeakySlope, ztile.array());
-    // First-layer assigns into _head_sum (replaces the memset);
-    // subsequent layers accumulate. Compile-time branch.
+    // First-layer assigns into _head_history at the current ring window
+    // (replaces stale data); subsequent layers accumulate. Compile-time branch.
     if constexpr (IsFirst)
       hsum_block = ztile;
     else
@@ -802,23 +870,27 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
 // For the A2 shape the detector only admits K in {6, 15}; any other value
 // here means something passed the detector that shouldn't have.
 //
-// is_first selects the layer-0-only code path that initializes _head_sum
-// via assignment (rather than accumulating into it). Branched at runtime
-// here, but inside the kernel the choice is a compile-time constant.
+// is_first selects the layer-0-only code path that initializes the recent
+// _head_history slots via assignment (rather than accumulating into them).
+// Branched at runtime here, but inside the kernel the choice is a compile-
+// time constant.
+//
+// head_wp is the snapshot of _head_write_pos at process() entry; layers
+// write the head accumulator directly into _head_history[head_wp + f].
 template <int Channels>
-void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int num_frames, bool is_first)
+void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int num_frames, bool is_first, int head_wp)
 {
   Layer& L = _layers[layer_idx];
   _ring_write(L, num_frames);
   switch (L.kernel_size)
   {
     case 6:
-      if (is_first) _layer_forward_k<6, true>(L, cond, num_frames);
-      else          _layer_forward_k<6, false>(L, cond, num_frames);
+      if (is_first) _layer_forward_k<6, true>(L, cond, num_frames, head_wp);
+      else          _layer_forward_k<6, false>(L, cond, num_frames, head_wp);
       break;
     case 15:
-      if (is_first) _layer_forward_k<15, true>(L, cond, num_frames);
-      else          _layer_forward_k<15, false>(L, cond, num_frames);
+      if (is_first) _layer_forward_k<15, true>(L, cond, num_frames, head_wp);
+      else          _layer_forward_k<15, false>(L, cond, num_frames, head_wp);
       break;
     default:
       throw std::runtime_error("A2FastModel: unexpected kernel_size "
@@ -828,11 +900,16 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
 
 // -----------------------------------------------------------------------------
 // Head: K=16 dilation-1 conv from Channels to 1, plus bias + scale.
+//
+// Caller (process()) must have advanced _head_write_pos to (head_wp +
+// num_frames) before invoking this function — that's the "post-write"
+// position the col_of() lambda assumes. Layers have already written this
+// buffer's head accumulators directly into _head_history[head_wp .. head_wp +
+// num_frames - 1].
 // -----------------------------------------------------------------------------
 template <int Channels>
 void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
 {
-  _head_ring_write(num_frames);
 #if NAM_A2_RING_MODE == 1
   const int mask = _head_pow2_mask;
   auto col_of = [&](int f, int k) {
@@ -858,6 +935,89 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
   }
 }
 
+#ifdef STRATUS_NAM_LAYER_PROFILING
+// -----------------------------------------------------------------------------
+// Per-layer profiling output (compiled in only with STRATUS_NAM_LAYER_PROFILING).
+// _dump_layer_stats prints min/mean/max per layer plus an aggregate summary;
+// _log_history_addresses prints each layer's history-buffer base address mod
+// 8 KB so we can spot Cortex-A8 L1 set-aliasing collisions.
+// -----------------------------------------------------------------------------
+template <int Channels>
+void A2FastModel<Channels>::_dump_layer_stats()
+{
+  std::ostringstream ss;
+  ss << "[NAM A2 layer-profiling] per-layer timing (ns), Channels=" << Channels << ":\n";
+  ss << "  idx   K   D    calls       min      mean       max  share%\n";
+  double total_ns_all = 0.0;
+  for (const auto& s : _layer_stats)
+    total_ns_all += s.total_ns;
+  for (int i = 0; i < kNumLayers; i++)
+  {
+    const auto& s = _layer_stats[i];
+    if (s.calls == 0) continue;
+    const double mean_ns = s.total_ns / static_cast<double>(s.calls);
+    const double share = (total_ns_all > 0.0) ? 100.0 * s.total_ns / total_ns_all : 0.0;
+    ss << "  " << std::setw(3) << i
+       << "  " << std::setw(2) << _layers[i].kernel_size
+       << "  " << std::setw(3) << _layers[i].dilation
+       << "  " << std::setw(7) << s.calls
+       << "  " << std::setw(8) << static_cast<long long>(s.min_ns)
+       << "  " << std::setw(8) << static_cast<long long>(mean_ns)
+       << "  " << std::setw(8) << static_cast<long long>(s.max_ns)
+       << "   " << std::fixed << std::setprecision(1) << std::setw(5) << share
+       << std::defaultfloat
+       << "\n";
+  }
+  if (_layer_stats_buffer_count > 0)
+  {
+    const double total_per_buf = total_ns_all / static_cast<double>(_layer_stats_buffer_count);
+    ss << "  TOTAL per-buffer mean across " << _layer_stats_buffer_count
+       << " buffers: " << static_cast<long long>(total_per_buf) << " ns\n";
+  }
+  std::cerr << ss.str();
+}
+
+template <int Channels>
+void A2FastModel<Channels>::_log_history_addresses()
+{
+  std::ostringstream ss;
+  ss << "[NAM A2 layer-profiling] history base addresses (Channels=" << Channels << "):\n";
+  ss << "  idx   K   D     pow2    base addr  base mod 8K\n";
+  for (int i = 0; i < kNumLayers; i++)
+  {
+    const auto& L = _layers[i];
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(L.history.data());
+#if NAM_A2_RING_MODE == 1
+    const int pow2 = L.pow2_size;
+#else
+    const int pow2 = L.history_cols;
+#endif
+    ss << "  " << std::setw(3) << i
+       << "  " << std::setw(2) << L.kernel_size
+       << "  " << std::setw(3) << L.dilation
+       << "  " << std::setw(7) << pow2
+       << "  0x" << std::hex << std::setw(8) << std::setfill('0') << addr
+       << "       0x" << std::setw(4) << (addr & 0x1FFFu)
+       << std::dec << std::setfill(' ')
+       << "\n";
+  }
+  const uintptr_t z_addr   = reinterpret_cast<uintptr_t>(_z.data());
+  const uintptr_t lin_addr = reinterpret_cast<uintptr_t>(_layer_in.data());
+  const uintptr_t hh_addr  = reinterpret_cast<uintptr_t>(_head_history.data());
+  ss << "  scratch:\n"
+     << "    _z            0x" << std::hex << std::setw(8) << std::setfill('0') << z_addr
+     << "       0x" << std::setw(4) << (z_addr & 0x1FFFu)
+     << std::dec << std::setfill(' ') << "\n"
+     << "    _layer_in     0x" << std::hex << std::setw(8) << std::setfill('0') << lin_addr
+     << "       0x" << std::setw(4) << (lin_addr & 0x1FFFu)
+     << std::dec << std::setfill(' ') << "\n"
+     << "    _head_history 0x" << std::hex << std::setw(8) << std::setfill('0') << hh_addr
+     << "       0x" << std::setw(4) << (hh_addr & 0x1FFFu)
+     << std::dec << std::setfill(' ') << "\n";
+  std::cerr << ss.str();
+}
+#endif
+
 // -----------------------------------------------------------------------------
 // DSP::process override
 // -----------------------------------------------------------------------------
@@ -882,12 +1042,68 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
       lin[c] = _rechannel_w[c] * x;
   }
 
-  // _head_sum is initialized by the first layer's IsFirst=true write
-  // (assignment, not accumulation) instead of an explicit memset here —
-  // skips Channels * num_frames * 4 bytes of zero-fill writes per buffer.
-  _layer_forward(0, cond, num_frames, /*is_first=*/true);
+  // Head accumulator: written directly into _head_history (no separate
+  // _head_sum buffer + memcpy). Snapshot the current write position and
+  // rewind the ring if writing num_frames more would overflow the writable
+  // contiguous range. The kept frames preserve the head's K=16 look-back
+  // window. _head_forward()'s col_of() lambda already masks every read, so
+  // reads continue to work correctly whether or not the rewind fired.
+  const int head_keep = kHeadKernelSize - 1;
+#if NAM_A2_RING_MODE == 1
+  const int head_capacity = _head_pow2_size;
+#else
+  const int head_capacity = _head_history_cols;
+#endif
+  if (_head_write_pos + num_frames > head_capacity)
+  {
+    std::memmove(_head_history.data(),
+                 _head_history.data() + static_cast<size_t>(_head_write_pos - head_keep) * Channels,
+                 static_cast<size_t>(head_keep) * Channels * sizeof(float));
+    _head_write_pos = head_keep;
+  }
+  const int head_wp = _head_write_pos;
+
+#ifdef STRATUS_NAM_LAYER_PROFILING
+  if (!_history_addrs_logged)
+  {
+    _log_history_addresses();
+    _history_addrs_logged = true;
+  }
+
+  for (int li = 0; li < kNumLayers; li++)
+  {
+    timespec t0{}, t1{};
+    clock_gettime(CLOCK_MONOTONIC_RAW, &t0);
+    _layer_forward(li, cond, num_frames, /*is_first=*/(li == 0), head_wp);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
+    const double ns = static_cast<double>(t1.tv_sec - t0.tv_sec) * 1e9
+                    + static_cast<double>(t1.tv_nsec - t0.tv_nsec);
+    auto& s = _layer_stats[li];
+    s.total_ns += ns;
+    s.calls++;
+    if (ns < s.min_ns) s.min_ns = ns;
+    if (ns > s.max_ns) s.max_ns = ns;
+  }
+
+  if (++_layer_stats_buffer_count >= kLayerStatsDumpInterval)
+  {
+    _dump_layer_stats();
+    for (auto& s : _layer_stats) s = LayerStats{};
+    _layer_stats_buffer_count = 0;
+  }
+#else
+  _layer_forward(0, cond, num_frames, /*is_first=*/true, head_wp);
   for (int li = 1; li < kNumLayers; li++)
-    _layer_forward(li, cond, num_frames, /*is_first=*/false);
+    _layer_forward(li, cond, num_frames, /*is_first=*/false, head_wp);
+#endif
+
+  // Advance _head_write_pos past this buffer's writes. _head_forward's
+  // col_of() lambda assumes _head_write_pos is the post-write position.
+#if NAM_A2_RING_MODE == 1
+  _head_write_pos = (head_wp + num_frames) & _head_pow2_mask;
+#else
+  _head_write_pos = head_wp + num_frames;
+#endif
 
   // Output.
   float* head_out = _head_out.data();
