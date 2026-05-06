@@ -656,7 +656,10 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     Eigen::Map<MatCDyn> hsum_block(_head_sum.data(), Channels, num_frames);
     Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, num_frames);
 
-    ztile.setZero();
+    // No ztile.setZero() — tap 0 below initializes ztile via vdupq_n_f32(0)
+    // accumulator seeding. Skips Channels * num_frames * 4 bytes of writes
+    // per layer per buffer (~94 KB at K=8 / mbs=128 / 23 layers) that would
+    // otherwise pollute L1 cache lines aliased to conv working data.
 
 #if defined(__ARM_NEON__)
     // -----------------------------------------------------------------------
@@ -671,6 +674,9 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     // 8 accumulators, so the in-order Cortex-A8 NEON pipeline can issue an
     // FMA every cycle.
     //
+    // Tap 0 seeds ztile (accumulators init to zero, no load from _z and no
+    // upfront setZero); taps 1..K-1 load+accumulate as usual.
+    //
     // 64 fp32 FMAs per tile × num_frames/4 tiles per tap × K taps per layer.
     // Replaces Eigen's 8x8 × 8xN GEMM, which dispatches to a small-matrix
     // path that hadn't kept its accumulators register-resident across taps.
@@ -679,29 +685,41 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       float* z = _z.data();
       const float* hist_base = L.history.data();
       const float* W_all = L.conv_w.data();
+      const int neonF = (num_frames / 4) * 4;
 
       for (int k = 0; k < K; k++)
       {
         const int tap_base = tap_base_phys(K - 1 - k);
         const float* W = W_all + static_cast<size_t>(k) * Channels * Channels;
         const float* hist = hist_base + static_cast<size_t>(tap_base) * Channels;
+        const bool seed = (k == 0);  // tap 0 seeds ztile, taps >=1 accumulate
 
-        const int neonF = (num_frames / 4) * 4;
         int f = 0;
         for (; f < neonF; f += 4)
         {
           float* z_base = z + static_cast<size_t>(f) * Channels;
           const float* h_base = hist + static_cast<size_t>(f) * Channels;
 
-          // Load running sum for 4 frames × 8 channels.
-          float32x4_t a0_lo = vld1q_f32(z_base + 0 * Channels + 0);
-          float32x4_t a0_hi = vld1q_f32(z_base + 0 * Channels + 4);
-          float32x4_t a1_lo = vld1q_f32(z_base + 1 * Channels + 0);
-          float32x4_t a1_hi = vld1q_f32(z_base + 1 * Channels + 4);
-          float32x4_t a2_lo = vld1q_f32(z_base + 2 * Channels + 0);
-          float32x4_t a2_hi = vld1q_f32(z_base + 2 * Channels + 4);
-          float32x4_t a3_lo = vld1q_f32(z_base + 3 * Channels + 0);
-          float32x4_t a3_hi = vld1q_f32(z_base + 3 * Channels + 4);
+          // Initialize accumulators: zero on tap 0 (seed), running sum from
+          // _z on taps >=1. The branch is loop-invariant within the K loop
+          // and predicted-not-taken K-1 of K times.
+          float32x4_t a0_lo, a0_hi, a1_lo, a1_hi, a2_lo, a2_hi, a3_lo, a3_hi;
+          if (seed)
+          {
+            const float32x4_t zero = vdupq_n_f32(0.0f);
+            a0_lo = a0_hi = a1_lo = a1_hi = a2_lo = a2_hi = a3_lo = a3_hi = zero;
+          }
+          else
+          {
+            a0_lo = vld1q_f32(z_base + 0 * Channels + 0);
+            a0_hi = vld1q_f32(z_base + 0 * Channels + 4);
+            a1_lo = vld1q_f32(z_base + 1 * Channels + 0);
+            a1_hi = vld1q_f32(z_base + 1 * Channels + 4);
+            a2_lo = vld1q_f32(z_base + 2 * Channels + 0);
+            a2_hi = vld1q_f32(z_base + 2 * Channels + 4);
+            a3_lo = vld1q_f32(z_base + 3 * Channels + 0);
+            a3_hi = vld1q_f32(z_base + 3 * Channels + 4);
+          }
 
           // Accumulate W[:,c'] * h[c',f] for each input channel c'.
           for (int cp = 0; cp < Channels; cp++)
@@ -741,7 +759,8 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
           const float* h_col = hist + static_cast<size_t>(f) * Channels;
           for (int o = 0; o < Channels; o++)
           {
-            float sum = z_col[o];
+            // Tap 0 seeds (sum=0); subsequent taps accumulate on top.
+            float sum = seed ? 0.0f : z_col[o];
             for (int cp = 0; cp < Channels; cp++)
               sum += W[cp * Channels + o] * h_col[cp];
             z_col[o] = sum;
@@ -750,13 +769,17 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       }
     }
 #else
-    // Eigen fallback for non-ARM builds (host-side dev / tests).
+    // Eigen fallback for non-ARM builds (host-side dev / tests). Tap 0
+    // assigns into ztile (replaces the dropped setZero); taps >=1 accumulate.
     for (int k = 0; k < K; k++)
     {
       const int tap_base = tap_base_phys(K - 1 - k);
       Eigen::Map<const MatCC> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
       Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
-      ztile.noalias() += W * input_block;
+      if (k == 0)
+        ztile.noalias() = W * input_block;
+      else
+        ztile.noalias() += W * input_block;
     }
 #endif
 
