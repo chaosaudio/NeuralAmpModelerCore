@@ -963,6 +963,64 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
   auto col_of = [&](int f, int k) { return base + f - (kHeadKernelSize - 1 - k); };
 #endif
 
+#if defined(__ARM_NEON__)
+  if constexpr (Channels == 3)
+  {
+    // 4-frame-tiled NEON kernel for the 3-channel path. process()'s rewind
+    // guarantees head_wp + num_frames ≤ head_pow2_size, so cols within a
+    // buffer are always contiguous in _head_history — no ring wrap mid-buffer.
+    // That lets us compute base_col once per tile (via col_of(f, 0)) and walk
+    // linearly through the 16 taps without re-masking. vld3q deinterleaves 4
+    // consecutive 3-channel cols into 3 frame-vectors (one per channel),
+    // matching the inner reduction's natural axis: y[f] += sum_b W[k][b] *
+    // H[col_of(f,k)][b].
+    //
+    // Per tile: 16 vld3q + 48 vmlaq_n + 1 vmulq_n + 1 vst1q. vld3q.32 on
+    // Cortex-A8 takes ~10 cycles each (LSU-bound) but pipelines behind the
+    // FMA chain. Vs the scalar path's 192 FMAs/tile at VFP scalar throughput,
+    // expected speedup ~3-3.5×.
+    const float scale_const = _head_scale;
+    const float bias = _head_b;
+    const float32x4_t bias_vec = vdupq_n_f32(bias);
+    const int neonF = (num_frames / 4) * 4;
+    int f = 0;
+    for (; f < neonF; f += 4)
+    {
+      float32x4_t y = bias_vec;
+      const int base_col = col_of(f, 0);
+      for (int k = 0; k < kHeadKernelSize; k++)
+      {
+        const float* src = &_head_history[static_cast<size_t>(base_col + k) * Channels];
+        const float32x4x3_t H = vld3q_f32(src);
+        const float w0 = _head_w[k][0];
+        const float w1 = _head_w[k][1];
+        const float w2 = _head_w[k][2];
+        y = vmlaq_n_f32(y, H.val[0], w0);
+        y = vmlaq_n_f32(y, H.val[1], w1);
+        y = vmlaq_n_f32(y, H.val[2], w2);
+      }
+      y = vmulq_n_f32(y, scale_const);
+      vst1q_f32(output + f, y);
+    }
+    // Scalar tail for any frames past the multiple-of-4 boundary.
+    for (; f < num_frames; f++)
+    {
+      float y = bias;
+      for (int k = 0; k < kHeadKernelSize; k++)
+      {
+        const int col = col_of(f, k);
+        const float* src = &_head_history[static_cast<size_t>(col) * Channels];
+        const float* wk = _head_w[k].data();
+        for (int b = 0; b < Channels; b++)
+          y += wk[b] * src[b];
+      }
+      output[f] = y * scale_const;
+    }
+    return;
+  }
+#endif
+
+  // Scalar path: 8-channel and any non-NEON build.
   for (int f = 0; f < num_frames; f++)
   {
     float y = _head_b;
