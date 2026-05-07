@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <sstream>
 
@@ -113,6 +114,36 @@ std::unique_ptr<DSP> ContainerConfig::create(std::vector<float> weights, double 
   if (!submodels_json.is_array() || submodels_json.empty())
     throw std::runtime_error("SlimmableContainer: 'submodels' must be a non-empty array");
 
+#if defined(NAM_SLIMMABLE_KEEP_SMALLEST_ONLY)
+  // Stratus only ever pins SlimmableContainer models to the smallest submodel
+  // via SetSlimmableSize(0.0) at load time (e.g., the 3-channel A2 Nano in an
+  // A2 model that also ships an 8-channel Standard). The 8-channel kernel
+  // costs ~6.4 MB of layer-history allocation plus prewarm time and is not
+  // real-time on Cortex-A8 1 GHz anyway. Build only the smallest submodel.
+  //
+  // Force the kept submodel's max_value to 1.0 so ContainerModel's
+  // constructor validation (last submodel must cover up to 1.0) passes.
+  // ContainerModel's _active_index defaults to size()-1; with one submodel
+  // that's index 0, so the subsequent SetSlimmableSize(0.0) on the host side
+  // becomes a fast-path no-op rather than a redundant Reset+Prewarm.
+  size_t smallest_idx = 0;
+  double smallest_max = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < submodels_json.size(); ++i)
+  {
+    double mv = submodels_json[i].at("max_value").get<double>();
+    if (mv < smallest_max)
+    {
+      smallest_max = mv;
+      smallest_idx = i;
+    }
+  }
+  std::vector<Submodel> submodels;
+  submodels.reserve(1);
+  const auto& entry = submodels_json[smallest_idx];
+  const auto& model_json = entry.at("model");
+  auto dsp = get_dsp(model_json);
+  submodels.push_back({1.0, std::move(dsp)});
+#else
   std::vector<Submodel> submodels;
   submodels.reserve(submodels_json.size());
 
@@ -126,6 +157,7 @@ std::unique_ptr<DSP> ContainerConfig::create(std::vector<float> weights, double 
 
     submodels.push_back({max_val, std::move(dsp)});
   }
+#endif
 
   return std::make_unique<ContainerModel>(std::move(submodels), sampleRate);
 }
