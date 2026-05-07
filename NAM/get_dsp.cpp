@@ -107,15 +107,15 @@ std::unique_ptr<DSP> get_dsp(const std::filesystem::path config_filename, dspDat
   std::ifstream i(config_filename);
   nlohmann::json j;
   i >> j;
-  get_dsp(j, returnedConfig);
-
-  /*Copy to a new dsp_config object for get_dsp below,
-   since not sure if weights actually get modified as being non-const references on some
-   model constructors inside get_dsp(dsp_config& conf).
-   We need to return unmodified version of dsp_config via returnedConfig.*/
-  dspData conf = returnedConfig;
-
-  return get_dsp(conf);
+  // get_dsp(json, returnedConfig) does both jobs in one call: populates
+  // returnedConfig AND builds + returns the model. Earlier code here built
+  // the model twice — once via this call (discarded) and again from a copy
+  // of returnedConfig — which doubled load time on Stratus (e.g., ~7 s vs
+  // ~3-4 s for an A2 SlimmableContainer model with two submodels). The
+  // paranoia-driven copy that justified the second build is no longer
+  // needed: the JSON-form internally copies dspData before moving out of
+  // weights, so returnedConfig is preserved for callers either way.
+  return get_dsp(j, returnedConfig);
 }
 
 std::unique_ptr<DSP> get_dsp(const nlohmann::json& config, dspData& returnedConfig)
