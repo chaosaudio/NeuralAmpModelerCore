@@ -69,6 +69,17 @@ void ContainerModel::Reset(const double sampleRate, const int maxBufferSize)
     sm.model->Reset(sampleRate, maxBufferSize);
 }
 
+void ContainerModel::ResetStateOnly(const int maxBufferSize)
+{
+  // The base DSP::ResetStateOnly just calls SetMaxBufferSize(), which on
+  // the container itself does nothing useful (the container has no
+  // per-layer state — it's a thin selector between submodels). The actual
+  // state lives in each submodel, so we forward.
+  DSP::ResetStateOnly(maxBufferSize);
+  for (auto& sm : _submodels)
+    sm.model->ResetStateOnly(maxBufferSize);
+}
+
 void ContainerModel::SetSlimmableSize(const double val)
 {
   size_t active_index = _submodels.size() - 1;

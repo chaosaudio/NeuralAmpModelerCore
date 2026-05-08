@@ -149,6 +149,28 @@ public:
     prewarm();
   }
 
+  /// \brief Zero internal state buffers without re-allocating or pre-warming.
+  ///
+  /// Use this when re-checking out a previously-loaded model from a cache:
+  /// the model's weights are still valid, but its layer-history rings,
+  /// scratch accumulators, etc. hold residual data from the last playback
+  /// session that needs to be cleared. Reset() / ResetAndPrewarm() also do
+  /// this but additionally run prewarm() (which can take ~150 ms for a
+  /// full A2 model) — too expensive on a cache hit path.
+  ///
+  /// Default implementation just calls SetMaxBufferSize() because most
+  /// subclasses' SetMaxBufferSize override does the actual zero-fill of
+  /// per-layer buffers (e.g. A2FastModel's _history_arena.assign).
+  /// SlimmableContainer overrides this to forward to all submodels (the
+  /// container's own SetMaxBufferSize doesn't propagate).
+  ///
+  /// Stratus uses this from NAMModelCache::take() — see that class for
+  /// the cache lifecycle.
+  virtual void ResetStateOnly(const int maxBufferSize)
+  {
+    SetMaxBufferSize(maxBufferSize);
+  }
+
   /// \brief Set the input level
   /// \param inputLevel Input level in dBu
   void SetInputLevel(const double inputLevel);
