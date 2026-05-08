@@ -60,7 +60,8 @@ namespace
 //   - condition_size == input_size == out_channels == 1
 //   - LeakyReLU(0.01) on every layer, no gating, no FiLM, no head1x1
 //   - layer1x1 active (groups=1), head rechannel conv k=16 bias=true
-//   - head_scale == 0.01, no post-stack head
+//   - head_scale present (value is unconstrained — read from weights
+//     stream at runtime), no post-stack head
 //
 // Weight storage: column-major per kernel tap. For a (out_ch × in_ch) matrix
 // at tap k, element (row=i, col=j) lives at w[k][j * out_ch + i]. All 1×1
@@ -1291,11 +1292,18 @@ bool is_a2_shape(const nlohmann::json& config, int* channels)
   if (head_it != config.end() && !head_it->is_null())
     return false;
 
-  // head_scale must be exactly 0.01
+  // head_scale must be present and numeric, but its actual value can be
+  // anything — the kernel reads the runtime head_scale from the trailing
+  // float in the weights stream, not from this JSON field. Different
+  // training runs (and different trainers, e.g. Tone3000 with custom
+  // loudness normalization) produce different head_scale values. Earlier
+  // versions of this detector hard-required ~0.01 here, which rejected
+  // architecturally-A2-shaped models with non-default scales (a real
+  // bug — see e.g. the bb252e23-... Tone3000 model with head_scale
+  // ≈ 0.00785). The actual A2 architectural signature is layer count /
+  // kernel sizes / dilations / activation / layer1x1 — checked below.
   auto hs_it = config.find("head_scale");
   if (hs_it == config.end() || !hs_it->is_number())
-    return false;
-  if (!close_to(hs_it->get<float>(), kHeadScale))
     return false;
 
   // in_channels defaults to 1, must be 1
