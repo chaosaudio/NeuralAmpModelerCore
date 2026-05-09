@@ -38,6 +38,8 @@
 #endif
 
 #include "../dsp.h"
+#include "model.h"
+#include "params.h"
 
 namespace nam
 {
@@ -1419,6 +1421,132 @@ bool is_a2_shape(const nlohmann::json& config, int* channels)
 
   if (channels)
     *channels = ch;
+  return true;
+}
+
+// Parsed-config detector. Mirrors the JSON detector field-by-field; both must
+// stay in sync. Used to route the .namb (binary) loader through the A2
+// fast-path: it builds a WaveNetConfig directly without any JSON intermediary,
+// so we cannot rely on the JSON-side detector for binary models. Distinct
+// name (not an overload) so JSON-side consumers don't need the full
+// WaveNetConfig definition for overload resolution.
+//
+// Note: condition_dsp/with_head are gating fields; A2 has no post-stack head
+// and no parametric conditioning. head_scale's actual numeric value is not
+// architecturally constraining (see comment on the JSON detector).
+bool is_a2_shape_from_parsed(const WaveNetConfig& config, int* channels)
+{
+  // Exactly one layer array
+  if (config.layer_array_params.size() != 1)
+    return false;
+
+  // No post-stack head
+  if (config.with_head)
+    return false;
+
+  // in_channels must be 1
+  if (config.in_channels != 1)
+    return false;
+
+  // No parametric conditioning DSP
+  if (config.condition_dsp != nullptr)
+    return false;
+
+  const auto& la = config.layer_array_params[0];
+
+  if (la.input_size != 1)
+    return false;
+  if (la.condition_size != 1)
+    return false;
+
+  if (la.channels != la.bottleneck)
+    return false;
+  if (la.channels != 3 && la.channels != 8)
+    return false;
+
+  // kernel_sizes must match kKernelSizes exactly
+  if (static_cast<int>(la.kernel_sizes.size()) != kNumLayers)
+    return false;
+  for (int i = 0; i < kNumLayers; i++)
+  {
+    if (la.kernel_sizes[i] != kKernelSizes[i])
+      return false;
+  }
+
+  // dilations must match kDilations exactly
+  if (static_cast<int>(la.dilations.size()) != kNumLayers)
+    return false;
+  for (int i = 0; i < kNumLayers; i++)
+  {
+    if (la.dilations[i] != kDilations[i])
+      return false;
+  }
+
+  // activation: all LeakyReLU(0.01)
+  if (static_cast<int>(la.activation_configs.size()) != kNumLayers)
+    return false;
+  for (const auto& ac : la.activation_configs)
+  {
+    if (ac.type != activations::ActivationType::LeakyReLU)
+      return false;
+    if (!ac.negative_slope.has_value())
+      return false;
+    if (std::fabs(*ac.negative_slope - kLeakySlope) > 1e-6f)
+      return false;
+  }
+
+  // gating_modes: all NONE
+  if (static_cast<int>(la.gating_modes.size()) != kNumLayers)
+    return false;
+  for (auto gm : la.gating_modes)
+  {
+    if (gm != GatingMode::NONE)
+      return false;
+  }
+  // (When gating is NONE, secondary_activation is unused; skip its content.)
+
+  // head1x1 inactive
+  if (la.head1x1_params.active)
+    return false;
+
+  // layer1x1 active with groups=1
+  if (!la.layer1x1_params.active)
+    return false;
+  if (la.layer1x1_params.groups != 1)
+    return false;
+
+  // Layer-array head rechannel: k=16, bias=true
+  if (la.head_kernel_size != kHeadKernelSize)
+    return false;
+  if (!la.head_bias)
+    return false;
+
+  // No FiLM anywhere
+  if (la.conv_pre_film_params.active)
+    return false;
+  if (la.conv_post_film_params.active)
+    return false;
+  if (la.input_mixin_pre_film_params.active)
+    return false;
+  if (la.input_mixin_post_film_params.active)
+    return false;
+  if (la.activation_pre_film_params.active)
+    return false;
+  if (la.activation_post_film_params.active)
+    return false;
+  if (la._layer1x1_post_film_params.active)
+    return false;
+  if (la.head1x1_post_film_params.active)
+    return false;
+
+  // No grouped convolutions
+  if (la.groups_input != 1)
+    return false;
+  if (la.groups_input_mixin != 1)
+    return false;
+
+  if (channels)
+    *channels = la.channels;
   return true;
 }
 

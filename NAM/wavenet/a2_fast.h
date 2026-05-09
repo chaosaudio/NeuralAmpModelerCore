@@ -24,6 +24,8 @@ namespace nam
 {
 namespace wavenet
 {
+struct WaveNetConfig;
+
 namespace a2_fast
 {
 
@@ -49,6 +51,23 @@ inline constexpr std::array<int, kNumLayers> kDilations = {
 /// \param channels Out-param set to 3 (A2 nano) or 8 (A2 standard) on match.
 /// \return true if every architectural knob matches the A2 signature exactly.
 bool is_a2_shape(const nlohmann::json& config, int* channels);
+
+/// \brief Strict detector against an already-parsed WaveNetConfig.
+/// Used to route both .nam (JSON) and .namb (binary) loaders through the
+/// same A2 fast-path: the binary loader produces a WaveNetConfig directly
+/// without ever touching JSON, so we must be able to detect A2 shape
+/// from the parsed struct as well.
+///
+/// Note: distinct name (not an overload of is_a2_shape) on purpose. nlohmann
+/// json has implicit conversion operators that, during overload resolution,
+/// instantiate type traits over the candidate parameter types. If this were
+/// declared as `is_a2_shape(const WaveNetConfig&, ...)`, every consumer of
+/// the JSON variant would need WaveNetConfig to be a complete type at the
+/// call site (not just forward-declared), polluting the include graph.
+/// \param config   Parsed WaveNet configuration.
+/// \param channels Out-param set to 3 (A2 nano) or 8 (A2 standard) on match.
+/// \return true if every architectural knob matches the A2 signature exactly.
+bool is_a2_shape_from_parsed(const WaveNetConfig& config, int* channels);
 
 /// \brief Build a ModelConfig that instantiates the A2 fast path.
 /// \pre is_a2_shape(config, ...) returned true.

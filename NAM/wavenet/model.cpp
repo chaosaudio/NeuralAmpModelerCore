@@ -1184,8 +1184,24 @@ nam::wavenet::WaveNetConfig nam::wavenet::parse_config_json(const nlohmann::json
 }
 
 // WaveNetConfig::create()
+//
+// JSON loaders normally short-circuit to A2FastConfig in wavenet::create_config()
+// before ever building a WaveNetConfig, so the A2 check below is a no-op for the
+// .nam path (it sees only non-A2 configs). The .namb (binary) loader, however,
+// builds a WaveNetConfig directly without any JSON intermediary — this is the
+// single chokepoint where both paths converge, so doing the A2 routing here
+// keeps binary and JSON loaders consistent without forking the loader logic.
 std::unique_ptr<nam::DSP> nam::wavenet::WaveNetConfig::create(std::vector<float> weights, double sampleRate)
 {
+#if defined(NAM_ENABLE_A2_FAST)
+  int a2_channels = 0;
+  if (a2_fast::is_a2_shape_from_parsed(*this, &a2_channels))
+  {
+    std::cerr << "[NAM] WaveNetConfig::create: A2 shape matched (channels=" << a2_channels
+              << "), routing to A2 fast-path" << std::endl;
+    return a2_fast::create_a2_fast(a2_channels, std::move(weights), sampleRate);
+  }
+#endif
   return std::make_unique<nam::wavenet::WaveNet>(in_channels, layer_array_params, head_scale, with_head,
                                                  std::move(head_params), std::move(weights), std::move(condition_dsp),
                                                  sampleRate);
