@@ -1137,7 +1137,32 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
   // Rechannel: layer_in[c, f] = _rechannel_w[c] * input[f] for c in Channels.
   // Also prepare float cond buffer (input copied to float for inner loops).
   float* cond = _cond.data();
-  for (int f = 0; f < num_frames; f++)
+  int f = 0;
+#if defined(__ARM_NEON__) && defined(NAM_SAMPLE_FLOAT)
+  if (Channels == 3)
+  {
+    // 4-frame NEON tile for the production 3-channel (Nano) shape.
+    // _layer_in is frame-major / channel-minor ([f0c0 f0c1 f0c2 f1c0 ...]),
+    // which is exactly vst3q_f32's 3-way interleave of {w0*x, w1*x, w2*x}
+    // — 4 frames of input become one vld1q + one vst1q (cond) + three
+    // vmulq_n + one vst3q, replacing 16 scalar loads/stores per tile.
+    const float w0 = _rechannel_w[0];
+    const float w1 = _rechannel_w[1];
+    const float w2 = _rechannel_w[2];
+    const int neon_frames = num_frames & ~3;
+    for (; f < neon_frames; f += 4)
+    {
+      const float32x4_t x = vld1q_f32(in0 + f);
+      vst1q_f32(cond + f, x);
+      float32x4x3_t lin3;
+      lin3.val[0] = vmulq_n_f32(x, w0);
+      lin3.val[1] = vmulq_n_f32(x, w1);
+      lin3.val[2] = vmulq_n_f32(x, w2);
+      vst3q_f32(&_layer_in[static_cast<size_t>(f) * 3], lin3);
+    }
+  }
+#endif
+  for (; f < num_frames; f++)
   {
     const float x = static_cast<float>(in0[f]);
     cond[f] = x;
@@ -1212,8 +1237,14 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
   // Output.
   float* head_out = _head_out.data();
   _head_forward(head_out, num_frames);
+#ifdef NAM_SAMPLE_FLOAT
+  // NAM_SAMPLE == float: the cast loop is a straight copy — let memcpy's
+  // tuned NEON path handle it.
+  std::memcpy(out0, head_out, static_cast<size_t>(num_frames) * sizeof(float));
+#else
   for (int f = 0; f < num_frames; f++)
     out0[f] = static_cast<NAM_SAMPLE>(head_out[f]);
+#endif
 }
 
 // -----------------------------------------------------------------------------
